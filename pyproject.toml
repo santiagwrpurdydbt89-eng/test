@@ -1,0 +1,17 @@
+[project]
+name = "ray-lance-s3"
+version = "0.1.0"
+description = "Ray Data 读写 S3 上 Lance 数据集的代码整理与示例"
+requires-python = ">=3.9"
+dependencies = ["ray[data]>=2.44", "pylance>=0.20", "pyarrow>=14"]
+
+[project.optional-dependencies]
+lance-ray = ["lance-ray>=0.5", "pylance>=9"]
+test = ["pytest", "moto[server]", "boto3"]
+
+[tool.setuptools]
+packages = ["ray_lance_s3"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

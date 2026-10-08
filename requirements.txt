@@ -1,0 +1,13 @@
+# Ray Data（含 ray.data.read_lance / Dataset.write_lance）
+ray[data]>=2.44
+# Lance Python SDK（包名 pylance，import lance）
+pylance>=0.20
+# lance-ray：Lance 官方的 Ray 集成（分布式写入、加列、压缩、建索引等）
+lance-ray>=0.5
+pyarrow>=14
+pandas
+
+# 仅测试使用：moto 提供本地 S3 兼容服务
+pytest
+moto[server]
+boto3
