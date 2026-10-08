@@ -159,6 +159,7 @@ footer { margin-top: 72px; color: var(--muted); font-size: 13px; border-top: 1px
     <li><a href="#lance-ray">lance-ray API</a></li>
     <li><a href="#two-phase">两阶段分布式写入</a></li>
     <li><a href="#maintenance">数据集运维</a></li>
+    <li><a href="#blob">大字段（Blob V2）</a></li>
     <li><a href="#pitfalls">常见坑</a></li>
     <li><a href="#repo">仓库结构与测试</a></li>
     <li><a href="#refs">参考资料</a></li>
@@ -168,7 +169,7 @@ footer { margin-top: 72px; color: var(--muted); font-size: 13px; border-top: 1px
 <main>
 <header>
   <h1>Ray 读写 S3 上的 Lance 数据集</h1>
-  <p class="lede">用 Ray Data 在 S3（及 MinIO 等 S3 兼容存储）上分布式读写 Lance 列存数据集：三种写法、S3 配置、版本兼容性，以及实测踩到的坑。</p>
+  <p class="lede">用 Ray Data 在 S3（及 MinIO 等 S3 兼容存储）上分布式读写 Lance 列存数据集：三种写法、S3 配置、版本兼容性、大字段（Blob V2），以及实测踩到的坑。</p>
   <div class="meta">实测环境：Ray 2.59.0 · pylance 13.0.0 / 4.0.2 · lance-ray 0.5.0 · pyarrow 25 · moto S3 · 2026-10</div>
 </header>
 
@@ -387,6 +388,75 @@ d.cleanup_old_versions(older_than=timedelta(days=7))   <span class="c"># from da
   <p>实测：连续 5 次 append 产生 5 个 fragment，<code>compact_files</code> 之后合并成 1 个（<code>fragments_removed=5, fragments_added=1</code>）。</p>
 </section>
 
+<section id="blob">
+  <h2>大字段（Blob V2）</h2>
+  <p>图片、音频、视频这类大二进制字段用 Lance 的 Blob V2 格式存储。写入时 Lance 按每个值的大小自动选择存储位置，扫描普通列时不会读到 blob 内容。需要 <code>data_storage_version="2.2"</code> 或更高，用 2.1 会报 <code>Blob v2 requires file version &gt;= 2.2</code>。</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>kind</th><th>默认大小范围</th><th>存储位置</th></tr></thead>
+    <tbody>
+      <tr><td>0 · inline</td><td>≤ 64 KiB</td><td>和普通列一起放在 <code>.lance</code> 数据文件里</td></tr>
+      <tr><td>1 · packed</td><td>64 KiB – 4 MiB</td><td>多个值拼接进同一个 <code>.blob</code> 文件，单个文件默认上限 1 GiB</td></tr>
+      <tr><td>2 · dedicated</td><td>&gt; 4 MiB</td><td>每个值单独一个 <code>.blob</code> 文件</td></tr>
+      <tr><td>3 · external</td><td>外部 URI</td><td>只记录 <code>s3://</code> / <code>file://</code> 地址，数据不复制</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>表中的边界是在 pylance 13.0.0 上逐个大小实测得到的：65,536 字节仍是 inline，65,537 变成 packed；4,194,304 是 packed，4,194,305 变成 dedicated。</p>
+
+  <h3>从 Ray 写入</h3>
+  <p>Ray 里的 <code>bytes</code> 列不能直接按 blob schema 写入，会报 <code>Unsupported cast from binary to struct</code>。要先在 <code>map_batches</code> 里转换成 blob 类型，转换后的列可以正常经过 Ray 交给 lance-ray 写入：</p>
+<pre><code>from ray_lance_s3.blob import blob_field, write_blob_dataset
+
+ds = ray.data.from_items([{"id": 1, "kind": "video", "payload": video_bytes}, ...])
+write_blob_dataset(
+    ds, "s3://bucket/media.lance",
+    {"payload": blob_field("payload",
+                           inline_size_threshold=0,                 <span class="c"># 0 = 从不内联</span>
+                           dedicated_size_threshold=8 * 1024**2,    <span class="c"># 超过 8 MiB 单独存文件</span>
+                           pack_file_size_threshold=512 * 1024**2)},<span class="c"># packed 文件上限 512 MiB</span>
+    opts, mode="overwrite",
+)
+<span class="c"># 等价于：</span>
+<span class="c"># lr.write_lance(ds.map_batches(to_blob_columns(["payload"]), batch_format="pyarrow"),</span>
+<span class="c">#                uri, data_storage_version="2.2", storage_options=opts)</span></code></pre>
+  <p>列里的值是 <code>str</code> 时按外部 URI 处理（external），不复制数据。外部地址默认必须在已注册的存储路径（bases）下，否则要传 <code>allow_external_blob_outside_bases=True</code>。传 <code>external_blob_mode="ingest"</code> 则会把外部数据复制进 Lance 自己的存储。</p>
+
+  <h3>在 Ray 中读取</h3>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>读取方式</th><th>blob 列返回</th></tr></thead>
+    <tbody>
+      <tr><td><code>ray.data.read_lance(uri)</code></td><td>描述信息（dict：kind / position / size / blob_id / blob_uri）</td></tr>
+      <tr><td><code>lance_ray.read_lance(uri)</code></td><td><span class="bad">完整内容（bytes）</span>，设置 <code>scanner_options={"blob_handling": ...}</code> 也不生效</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>直接用 lance-ray 读整张表，会把所有 blob 内容拉进 Ray object store。<code>read_with_blobs</code> 先只读普通列和 <code>_rowaddr</code>，过滤之后再在每个 batch 里调用 <code>read_blobs</code> 批量取内容：</p>
+<pre><code>from ray_lance_s3.blob import read_with_blobs
+
+images = read_with_blobs(
+    "s3://bucket/media.lance", "payload", opts,
+    filter="kind = 'image'",   <span class="c"># 在不带 blob 内容的数据上过滤</span>
+    batch_size=16,             <span class="c"># 每批取多少个 blob，blob 越大设得越小</span>
+)
+images.map_batches(decode_and_resize, ...)</code></pre>
+  <p>它会把版本固定在调用时的最新版本，保证 <code>_rowaddr</code> 与读取 blob 时看到的数据一致。<code>read_blobs</code> 在 Rust 层规划 I/O，会合并相邻请求并控制并发。</p>
+
+  <h3>单机随机访问与范围读取</h3>
+<pre><code>d = lance.dataset("s3://bucket/media.lance", storage_options=opts)
+d.to_table(columns=["payload"])                  <span class="c"># 只返回描述信息，不读内容</span>
+
+with d.take_blobs("payload", indices=[42])[0] as f:   <span class="c"># 类文件对象，支持 seek/read</span>
+    f.seek(1024 * 1024)
+    chunk = f.read(4096)                          <span class="c"># 只从 S3 读这 4 KB</span>
+
+d.read_blobs("payload", indices=[1, 2, 3])        <span class="c"># 批量读完整内容</span>
+d.read_blob_ranges("payload",                     <span class="c"># 一次读多个字节范围，自动合并</span>
+                   [(42, 0, 1024), (42, 4096, 1024)], selector="indices")</code></pre>
+  <p>和 pylance 4.0.2 对比：<code>blob_field</code> 和 <code>take_blobs</code> 在 4.0.2 已经有了；<code>read_blobs</code>、<code>read_blob_ranges</code>、按列配置阈值、<code>blob_pack_file_size_threshold</code>、<code>external_blob_mode</code> 都是 4.0.2 之后才加入的。</p>
+</section>
+
 <section id="pitfalls">
   <h2>常见坑</h2>
   <ol class="pitfalls">
@@ -397,6 +467,8 @@ d.cleanup_old_versions(older_than=timedelta(days=7))   <span class="c"># from da
     <li><strong>MinIO 等 http endpoint</strong>：需要同时设置 <code>aws_endpoint</code> 和 <code>allow_http="true"</code>；<code>aws_region</code> 也要填（MinIO 填 <code>us-east-1</code> 就行）。</li>
     <li><strong>Ray 的 tensor 列写入后类型是 <code>large_list&lt;float&gt;</code></strong>：而 Lance 的向量索引要求 <code>fixed_size_list&lt;float32, dim&gt;</code>。要建向量索引的话，写入时传 <code>schema=</code>，把向量列指定成 <code>pa.list_(pa.float32(), dim)</code>（已验证 <code>lance_ray.write_lance</code> 会按该 schema 写成 <code>fixed_size_list&lt;float&gt;[dim]</code>）。</li>
     <li><strong>overwrite 不会删除旧数据</strong>：每次写入都会生成新版本，旧版本仍可 time travel，S3 用量会一直增长。定期执行 <code>cleanup_old_versions()</code>。</li>
+    <li><strong>Blob 列要先转换类型、读取要避免全量拉取</strong>：Ray 的 bytes 列需要先转成 blob 类型才能写入；<code>lance_ray.read_lance</code> 会把 blob 内容全部读进内存。见<a href="#blob">大字段</a>。</li>
+    <li><strong>传给 <code>map_batches</code> 的函数要能在 worker 上反序列化</strong>：函数如果引用了某个本地包里的模块级对象，cloudpickle 会按模块名序列化它，集群节点上没装这个包就会报 <code>ModuleNotFoundError</code>。可以用 <code>ray.init(runtime_env={"py_modules": [...]})</code> 分发代码，或者让函数只引用 lance / pyarrow 这类已安装的包。本仓库的 <code>read_with_blobs</code> 采用的是后一种做法。</li>
     <li><strong>并发写同一个数据集</strong>：多个作业同时 append 时，Lance 会用乐观并发自动重试提交；overwrite 与其他写入并发会冲突，应当串行执行。</li>
   </ol>
 </section>
@@ -407,11 +479,13 @@ d.cleanup_old_versions(older_than=timedelta(days=7))   <span class="c"># from da
   s3_config.py      <span class="c"># S3Config → storage_options</span>
   io.py             <span class="c"># 三种读写方式 + ray_native_write_supported()</span>
   maintenance.py    <span class="c"># add_columns / compact_files / create_scalar_index / list_versions</span>
+  blob.py           <span class="c"># Blob V2：blob_field / write_blob_dataset / read_with_blobs / blob_layout</span>
 examples/
   01_ray_native.py        <span class="c"># Ray 内置读写 + 谓词下推 + time travel</span>
   02_lance_ray.py         <span class="c"># lance-ray 批量/流式写入，按 fragment 读取</span>
   03_fragment_writer.py   <span class="c"># 两阶段写入 + worker 端 transform</span>
   04_maintenance.py       <span class="c"># 加列、合并小文件、建索引、版本列表</span>
+  05_blob.py              <span class="c"># 大字段写入、按需读取、随机访问与范围读取</span>
 tests/                    <span class="c"># moto 本地 S3 端到端测试</span>
 docker-compose.yml        <span class="c"># 本地 MinIO</span></code></pre>
   <h3>运行示例（本地 MinIO）</h3>
@@ -426,8 +500,8 @@ cd examples &amp;&amp; python 02_lance_ray.py</code></pre>
   <table>
     <thead><tr><th>环境</th><th>结果</th></tr></thead>
     <tbody>
-      <tr><td>Ray 2.59 + pylance 13 + lance-ray 0.5</td><td><span class="ok">7 passed</span>，1 skipped（Ray 内置写入）</td></tr>
-      <tr><td>Ray 2.59 + pylance 4.0.2 / 3.0.2</td><td><span class="ok">Ray 内置读写用例通过</span>，lance-ray 用例跳过</td></tr>
+      <tr><td>Ray 2.59 + pylance 13 + lance-ray 0.5</td><td><span class="ok">13 passed</span>，1 skipped（Ray 内置写入）</td></tr>
+      <tr><td>Ray 2.59 + pylance 4.0.2 / 3.0.2</td><td><span class="ok">Ray 内置读写用例通过</span>，lance-ray 和 blob 用例跳过</td></tr>
     </tbody>
   </table>
   </div>
@@ -441,6 +515,7 @@ cd examples &amp;&amp; python 02_lance_ray.py</code></pre>
     <li><a href="https://github.com/lancedb/lance-ray">lance-ray（GitHub）</a></li>
     <li><a href="https://lance.org/guide/object_store/">Lance: Object Store 配置</a></li>
     <li><a href="https://lance.org/guide/read_and_write/">Lance: 读写与谓词下推</a></li>
+    <li><a href="https://lancedb.com/blog/newsletter-march-2026">LanceDB Newsletter：Lance Blob V2</a></li>
   </ul>
 </section>
 

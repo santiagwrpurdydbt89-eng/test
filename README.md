@@ -36,6 +36,29 @@ lr_write_lance(ds, "s3://bucket/path/table.lance", opts, mode="overwrite")
 ds = lr_read_lance("s3://bucket/path/table.lance", opts, columns=["id"], filter="score > 0.5")
 ```
 
+## 大字段（Blob V2）
+
+图片、音频、视频等大字段用 Lance Blob V2 存储（需要 `data_storage_version >= "2.2"`）。写入时按值的大小自动选择存储位置，pylance 13 实测默认阈值如下：
+
+| 大小 | 存储方式 |
+| --- | --- |
+| ≤ 64 KiB | inline：和普通列一起放在数据文件里 |
+| 64 KiB ~ 4 MiB | packed：多个值拼进同一个 `.blob` 文件 |
+| > 4 MiB | dedicated：每个值单独一个 `.blob` 文件 |
+| 外部 URI | external：只记录地址 |
+
+```python
+from ray_lance_s3.blob import blob_field, read_with_blobs, write_blob_dataset
+
+# Ray 的 bytes 列要先转成 blob 类型才能写入，write_blob_dataset 会自动转换
+write_blob_dataset(ds, uri, ["payload"], opts)
+
+# lance_ray.read_lance 会把 blob 内容全部读进内存；read_with_blobs 先过滤，再按需批量读取
+images = read_with_blobs(uri, "payload", opts, filter="kind = 'image'", batch_size=16)
+```
+
+完整示例见 `examples/05_blob.py`。
+
 ## 目录结构
 
 ```
@@ -43,7 +66,8 @@ ray_lance_s3/
   s3_config.py      # S3Config → storage_options（AWS / MinIO / 自定义 endpoint）
   io.py             # 三种读写方式的封装 + 兼容性检测
   maintenance.py    # 分布式加列、合并小文件、建标量索引、版本列表
-examples/           # 01~04 可运行示例（从环境变量读取 S3 配置）
+  blob.py           # Blob V2 大字段：写入转换、按需读取、存储分布统计
+examples/           # 01~05 可运行示例（从环境变量读取 S3 配置）
 tests/              # 基于 moto 本地 S3 的端到端测试
 docs/index.html     # 完整 HTML 文档
 docker-compose.yml  # 本地 MinIO
